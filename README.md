@@ -1,6 +1,20 @@
 # Truth Social Monitor
 
 This script monitors Donald Trump's account on Truth Social for new posts, translates them into Japanese, and sends them to a Discord channel via a webhook.
+  
+Translation uses either MyMemory API or Gemini. You can set it to your preferred language by changing the following settings. The default is translation to Japanese.
+
+`.env` file example:
+```
+TARGET_LANGUAGE=ja # Change to your preferred language
+```
+
+`prompt` file example:
+```
+Please translate the following English text into natural-sounding Japanese.
+```
+
+If you do not configure Gemini API, it will be handled by MyMemory API(Free API).
 
 ## Features
 
