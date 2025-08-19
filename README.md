@@ -106,7 +106,7 @@ To suppress all logging output except for errors, use the `-s` or `--silent` fla
 
 crontab example:
 ```bash
-5 * * * * /path/to/truth-social-monitor -s >> /dev/null 2>&1
+5 * * * * /usr/bin/python3 /path/to/truth-social-monitor -s >> /dev/null 2>&1
 ```
 
 ### Command-line Arguments
