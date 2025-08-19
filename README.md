@@ -117,7 +117,7 @@ crontab example:
 ## How It Works
 
 1.  **Fetch**: The script uses a `curl_chrome116` subprocess to fetch the latest statuses from the Truth Social API, bypassing browser checks.
-2.  **Filter**: It filters for original posts (not replies or re-posts) from the target user (`@realDonaldTrump`).
+2.  **Filter**: It filters for original posts (not replies or re-posts) from the target user (`@realDonaldTrump`). by default it will notify discord, but there is filtering in the script so change this if necessary.
 3.  **Cache Check**: For each post, it generates a unique hash and checks if a corresponding file exists in the `./cache` directory. If it exists, the post is considered old and is skipped.
 4.  **Process & Translate**: If a post is new:
     - The HTML is stripped from the content.
