@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+import os
+import json
+import re
+import sys
+import time
+import requests
+import subprocess
+import tempfile
+import hashlib
+import argparse
+from datetime import datetime
+from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# global silent mode flag
+SILENT_MODE = False
+
+def print_log(message):
+    """print message if not in silent mode"""
+    if not SILENT_MODE:
+        print(message)
+
+def print_error(message):
+    """print error message regardless of silent mode"""
+    print(message, file=sys.stderr)
+
+# envroment variables
+load_dotenv()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+BASE_URL = "https://truthsocial.com/api/v1/accounts/107780257626128497/statuses"
+CACHE_DIR = "./cache"
+TARGET_USERNAME = "realDonaldTrump"
+POST_LIMIT = 20
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
+if not DISCORD_WEBHOOK_URL:
+    print_error("DISCORD_WEBHOOK_URL is not set in the environment variables.")
+    sys.exit(1)
+
+def init_cache():
+    """initialize cache directory"""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+def load_prompt(filepath="prompt") -> str:
+    """load prompt from a file."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print_error(f"Error loading prompt file: {e}")
+        sys.exit(1) 
+TRANSLATION_PROMPT = load_prompt()
+
+def get_post_hash(post_id, created_at):
+    """generate a unique hash for the post based on its ID and creation time."""
+    cache_key = f"{post_id}_{created_at}"
+    return hashlib.md5(cache_key.encode()).hexdigest()
+
+def is_new_post(post_id, created_at):
+    """check if the post is new by checking if its hash exists in the cache."""
+    hash_value = get_post_hash(post_id, created_at)
+    cache_file = os.path.join(CACHE_DIR, f"{hash_value}.cache")
+    return not os.path.exists(cache_file)
+
+def is_url_only_post(text: str) -> bool:
+    """check if the post content is a URL only."""
+    if not text:
+        return False
+    # strip leading/trailing whitespace
+    stripped = text.strip()
+    # http/https URL regex
+    if re.match(r'^(https?://\S+)$', stripped):
+        return True
+    return False
+
+def save_to_cache(post_id, created_at):
+    """save post information to cache."""
+    hash_value = get_post_hash(post_id, created_at)
+    cache_file = os.path.join(CACHE_DIR, f"{hash_value}.cache")
+    cache_data = {
+        "id": post_id,
+        "created_at": created_at
+    }
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+
+def cleanup_cache():
+    """clean up old cache files, keeping only the latest 30."""
+    try:
+        cache_files = [f for f in os.listdir(CACHE_DIR) if f.endswith('.cache')]
+        
+        if len(cache_files) < 30:
+            return
+        
+        # get file modification times
+        cache_files_with_time = []
+        for filename in cache_files:
+            filepath = os.path.join(CACHE_DIR, filename)
+            try:
+                mtime = os.path.getmtime(filepath)
+                cache_files_with_time.append((filename, filepath, mtime))
+            except Exception:
+                continue
+        
+        # sort files by modification time (oldest first)
+        cache_files_with_time.sort(key=lambda x: x[2])
+        
+        # delete all but the latest 29 files
+        files_to_delete = cache_files_with_time[:-29]  # keep the latest 29 files
+        
+        for filename, filepath, _ in files_to_delete:
+            try:
+                os.unlink(filepath)
+                print_log(f"Delete old cache: {filename}")
+            except Exception as e:
+                print_log(f"Cache deletion failed {filename}: {e}")
+                
+    except Exception as e:
+        print_log(f"Error in cache cleanup: {e}")
+
+def is_video_file(url):
+    """check if the URL points to a video file based on its extension or MIME type."""
+    video_extensions = ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.m4v']
+    video_mime_types = ['video/', 'application/x-mpegURL']
+    
+    # check file extension
+    url_lower = url.lower()
+    for ext in video_extensions:
+        if ext in url_lower:
+            return True
+    
+    # check MIME type
+    for mime in video_mime_types:
+        if mime in url_lower:
+            return True
+            
+    return False
+
+def get_file_info(url):
+    """Get file size and type from the URL using HEAD request."""
+    try:
+        # get file size and type using HEAD request
+        response = requests.head(url, timeout=10, allow_redirects=True)
+        content_length = response.headers.get('content-length')
+        content_type = response.headers.get('content-type', '')
+        
+        file_size = int(content_length) if content_length else 0
+        is_video = content_type.startswith('video/') or is_video_file(url)
+        
+        return file_size, is_video, content_type
+    except Exception as e:
+        print_error(f"File information acquisition failure: {e}")
+        # fallback to default values
+        return 0, is_video_file(url), 'unknown'
+
+def send_to_discord(content, translated_content, url, media_urls=None):
+    """Send post content to Discord via webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        print_error("DISCORD_WEBHOOK_URL not set")
+        return
+
+    # configure requests session with retry strategy
+    session = requests.Session()
+    session.timeout = (10, 30)  # set timeout for connection and read
+    
+    retry_strategy = Retry(
+        total=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=1,
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    # Determine if the post has media or video
+    has_media = media_urls and len(media_urls) > 0
+    has_video = False
+    
+    if has_media:
+        file_size, has_video, content_type = get_file_info(media_urls[0])
+        print_log(f"Media information: Size={file_size/1024/1024:.1f}MB, Video={has_video}, Type={content_type}")
+
+    # Discord message content
+    if content == "(Media Post)":
+        if has_video:
+            discord_content = f"**New video post**\n\n**Post URL**: {url}"
+        else:
+            discord_content = f"**New picture post**\n\n**Post URL**: {url}"
+    else:
+        discord_content = f"**Original**: {content}\n\n**Translated**: {translated_content}\n\n**Post URL**: {url}"
+        if has_video:
+            discord_content += f"\n**With video**"
+
+    payload = {
+        "username": "Truth Social Monitor",
+        "avatar_url": "https://truthsocial.com/favicon.ico",
+        "content": discord_content
+    }
+
+    try:
+        # if the post has a video, send the link directly
+        if has_video:
+            response = session.post(DISCORD_WEBHOOK_URL, json=payload)
+            response.raise_for_status()
+            print_log("Sent video post to Discord")
+            return
+        
+        # if the post has media but no video, check file size
+        if has_media and not has_video:
+            file_size, _, _ = get_file_info(media_urls[0])
+            
+            # if the file size is too large, send only the link(8MB limit)
+            if file_size > 8 * 1024 * 1024:  # 8MB
+                print_log(f"File size is too large: {file_size / 1024 / 1024:.1f}MB - sending link only")
+                response = session.post(DISCORD_WEBHOOK_URL, json=payload)
+                response.raise_for_status()
+                print_log("Sent the link of the large image to Discord")
+                return
+
+            # if the file is small enough, download and send it
+            tmp_file_path = f"/tmp/truthsocial_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+            try:
+                curl_cmd = [
+                    "/usr/bin/curl",
+                    "-s",
+                    "-L",
+                    "-o", tmp_file_path,
+                    "--connect-timeout", "30",
+                    "--max-time", "60",
+                    media_urls[0]
+                ]
+                
+                subprocess.run(curl_cmd, check=True)
+
+                with open(tmp_file_path, 'rb') as image_file:
+                    files = {'file': (os.path.basename(tmp_file_path), image_file, 'image/jpeg')}
+                    
+                    response = session.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+                    response.raise_for_status()
+                    print_log("Post with an image has been sent to Discord")
+
+            except subprocess.CalledProcessError as e:
+                print_log(f"Image download failed: {e} - sending link only")
+                session.post(DISCORD_WEBHOOK_URL, json=payload)
+            
+            finally:
+                if os.path.exists(tmp_file_path):
+                    try:
+                        os.unlink(tmp_file_path)
+                    except Exception as e:
+                        print_log(f"Temporary file deletion failed: {e}")
+        else:
+            # if no media, just send the text content
+            response = session.post(DISCORD_WEBHOOK_URL, json=payload)
+            response.raise_for_status()
+            print_log("Sent text post to Discord")
+
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        print_error(f"Discord sending timeout/connection error: {type(e).__name__}")
+    except requests.exceptions.HTTPError as e:
+        print_error(f"Discord HTTP error: {e}")
+        if e.response:
+            print_error(f"Response: {e.response.text}")
+    except Exception as e:
+        print_error(f"Unexpected error: {e}")
+    finally:
+        session.close()
+
+def translate_with_free_service(text):
+    """Free translation service using MyMemory API."""
+    if not text or not text.strip():
+        return text
+        
+    try:
+        api_url = "https://api.mymemory.translated.net/get"
+        params = {
+            'q': text[:500],  # 500 limit for MyMemory API
+            'langpair': 'en|ja' # English to Japanese
+        }
+        
+        response = requests.get(api_url, params=params, timeout=15)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get('responseStatus') == 200:
+            translated = result.get('responseData', {}).get('translatedText', '').strip()
+            
+            if translated and len(translated) > 0 and translated != text:
+                print_log("Translated using MyMemory API")
+                return translated
+            else:
+                print_log("MyMemory API returned empty or same text")
+                return text
+        else:
+            print_log("MyMemory API returned an error status")
+            return text
+            
+    except requests.exceptions.RequestException as e:
+        print_error(f"MyMemory API request error: {e}")
+        return text
+    except Exception as e:
+        print_error(f"MyMemory API Unexpected error: {e}")
+        return text
+
+def translate_with_gemini(text):
+    """Gemini translation"""
+    if not text or not text.strip():
+        return text
+        
+    if not GEMINI_API_KEY:
+        print_log("GEMINI_API_KEY not set, using free translation service")
+        return translate_with_free_service(text)
+    
+    try:
+        # check text length
+        if len(text) > 8000:
+            text = text[:7900] + "..."
+            print_log("text too long, truncating to 8000 characters")
+        
+        # translation prompt
+        prompt = f"""{TRANSLATION_PROMPT}
+
+original text:
+{text}"""
+
+        # Gemini API request payload
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "topP": 0.8,
+                "topK": 40,
+                "maxOutputTokens": 2048
+            }
+        }
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # Add API key to payload
+        url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # response validation
+        if "candidates" in result and len(result["candidates"]) > 0:
+            candidate = result["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                translated = candidate["content"]["parts"][0].get("text", "").strip()
+                
+                # translation result validation
+                if translated and len(translated) > 0:
+                    # check if translation is appropriate
+                    if translated == text or len(translated) < len(text) * 0.3:
+                        print_log("translation seems inappropriate - using free translation service")
+                        return translate_with_free_service(text)
+                    return translated
+                else:
+                    print_log("Gemini translation returned empty text - using free translation service")
+                    return translate_with_free_service(text)
+            else:
+                print_log("Gemini response format error - using free translation service")
+                return translate_with_free_service(text)
+        else:
+            print_log("Gemini API returned no candidates - using free translation service")
+            return translate_with_free_service(text)
+            
+    except requests.exceptions.HTTPError as e:
+        if e.response and e.response.status_code == 429:
+            print_error("Gemini API rate limit exceeded - using free translation service")
+            return translate_with_free_service(text)
+        else:
+            print_error(f"Gemini API HTTP error: {e} - using free translation service")
+            return translate_with_free_service(text)
+    except requests.exceptions.RequestException as e:
+        print_error(f"Gemini API request error: {e} - using free translation service")
+        return translate_with_free_service(text)
+    except KeyError as e:
+        print_error(f"Gemini API response parsing error: {e} - using free translation service")
+        return translate_with_free_service(text)
+    except Exception as e:
+        print_error(f"Gemini API unexpected error: {e} - using free translation service")
+        return translate_with_free_service(text)
+
+def fetch_posts():
+    """get posts from Truth Social API"""
+    params = {
+        "exclude_replies": "true",
+        "only_replies": "false",
+        "with_muted": "true",
+        "limit": str(POST_LIMIT)
+    }
+    
+    # build the URL with parameters
+    # use curl_chrome116 for compatibility with Truth Social
+    url = f"{BASE_URL}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+    try:
+        cmd = [
+            "/usr/local/bin/curl_chrome116",
+            "-H", "accept: application/json, text/plain, */*",
+            "-H", f"referer: https://truthsocial.com/@{TARGET_USERNAME}",
+            "--compressed",
+            "--connect-timeout", "30",
+            url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except Exception as e:
+        print_error(f"request error: {e}")
+        return None
+
+def clean_html(raw_html):
+    """remove HTML tags from the content"""
+    if not raw_html:
+        return ""
+    return re.sub('<.*?>', '', raw_html)
+
+def is_target_user(post):
+    """check if the post is from the target user"""
+    try:
+        account = post.get("account", {})
+        content = post.get("content", "")
+        has_other_user_link = bool(re.search(r'https://truthsocial\.com/users/[^/]+/statuses/\d+', content))
+        return (
+            account.get("username") == f"{TARGET_USERNAME}"
+            and post.get("in_reply_to_id") is None
+            and not has_other_user_link
+        )
+    except Exception:
+        return False
+
+def process_posts():
+    """Process posts from Truth Social API, translate them, and send to Discord."""
+    print_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: checking for new posts...")
+    
+    posts = fetch_posts()
+    if not posts:
+        print_error("Failed to fetch posts or no posts found")
+        return []
+    
+    new_posts = []
+    
+    for post in posts:
+        try:
+            if not is_target_user(post):
+                continue
+                
+            post_id = post.get("id")
+            created_at = post.get("created_at")
+            
+            if not post_id or not created_at:
+                continue
+            
+            # check if the cache already has this post
+            if not is_new_post(post_id, created_at):
+                continue
+                
+            content = clean_html(post.get("content", "")).strip()
+            media_urls = [media.get("url", "") for media in post.get("media_attachments", []) if media.get("url")]
+            post_url = post.get("url", "")
+            
+            if not post_url:
+                continue
+                
+            if not content and media_urls:
+                content = "(Media Post)"
+                
+            # translate content
+            if is_url_only_post(content):
+                translated_content = "(URL only post, no translation)"
+            elif content and content != "(Media Post)":
+                translated_content = translate_with_gemini(content)
+            else:
+                translated_content = "(No translation required)"
+            
+            # send to Discord
+            send_to_discord(content, translated_content, post_url, media_urls)
+            
+            # save to cache
+            save_to_cache(post_id, created_at)
+            print_log(f"Post saved to cache: {post_id} - {created_at}")
+            
+            new_posts.append(post_id)
+            
+        except Exception as e:
+            print_error(f"Error processing post {post.get('id', 'unknown')}: {e}")
+            continue
+    
+    # cleanup old cache files
+    cleanup_cache()
+    
+    return new_posts
+
+def daemon_mode(interval):
+    """Run in daemon mode with periodic checks"""
+    print_log(f"Starting daemon mode with {interval} second intervals...")
+    
+    while True:
+        try:
+            new_posts = process_posts()
+            if new_posts:
+                print_log(f"{len(new_posts)} new posts found and processed")
+            else:
+                print_log("No new posts found")
+        except Exception as e:
+            print_error(f"An error occurred: {e}")
+        
+        print_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Finished checking for new posts")
+        print_log(f"Waiting {interval} seconds for next check...")
+        time.sleep(interval)
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Truth Social Monitor - Monitor and translate posts from Truth Social",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                 # Run once and exit
+  %(prog)s -s              # Run silently (errors only to stderr)
+  %(prog)s -d 60           # Run in daemon mode with 60 second intervals
+  %(prog)s -d 300 -s       # Run in daemon mode with 5 minute intervals silently
+        """
+    )
+    
+    parser.add_argument(
+        "-s", "--silent",
+        action="store_true",
+        help="Silent mode - suppress all output"
+    )
+    
+    parser.add_argument(
+        "-d", "--daemon",
+        type=int,
+        metavar="SECONDS",
+        help="Daemon mode - run continuously with specified interval in seconds (default: 300)"
+    )
+    
+    return parser.parse_args()
+
+def main():
+    """Main function to initialize cache, fetch posts, translate, and send to Discord."""
+    global SILENT_MODE
+    
+    args = parse_arguments()
+    SILENT_MODE = args.silent
+
+    init_cache()
+    print_log("Truth Social Monitor")
+    print_log(f"Target: @{TARGET_USERNAME}")
+    
+    if args.daemon:
+        interval = args.daemon if args.daemon > 0 else 300  # Default to 5 minutes if invalid
+        daemon_mode(interval)
+    else:
+        try:
+            new_posts = process_posts()
+            if new_posts:
+                print_log(f"{len(new_posts)} new posts found and processed")
+            else:
+                print_log("No new posts found")
+        except Exception as e:
+            print_error(f"An error occurred: {e}")
+        
+        print_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Finished checking for new posts")
+
+if __name__ == "__main__":
+    main()
