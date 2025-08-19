@@ -280,7 +280,7 @@ def translate_with_free_service(text):
         api_url = "https://api.mymemory.translated.net/get"
         params = {
             'q': text[:500],  # 500 limit for MyMemory API
-            'langpair': 'en|ja' # English to Japanese
+            'langpair': f'en|{os.getenv("TARGET_LANGUAGE", "ja")}' # default to Japanese
         }
         
         response = requests.get(api_url, params=params, timeout=15)
