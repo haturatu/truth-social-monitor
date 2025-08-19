@@ -104,7 +104,7 @@ To suppress all logging output except for errors, use the `-s` or `--silent` fla
 ./truth-social-monitor -d 300 -s
 ```
 
-cronjob example:
+crontab example:
 ```bash
 5 * * * * /path/to/truth-social-monitor -s >> /dev/null 2>&1
 ```
